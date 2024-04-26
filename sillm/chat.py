@@ -4,7 +4,137 @@ import argparse
 import sillm
 import sillm.utils as utils
 
+import sys
+import select
+import tty
+import termios
+from cmd import Cmd
+
+class bcolors:
+    USER = '\033[93m'
+    AI = '\033[92m'
+    DEBUG = '\033[94m'
+
+class NonBlockingConsole(object):
+
+    def __enter__(self):
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        return self
+
+    def __exit__(self, type, value, traceback):
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
+
+    def get_data(self):
+        if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+            return sys.stdin.read(1)
+        return False
+
+
+class CommandPrompt(Cmd):
+    prompt = f"{bcolors.USER}> "
+    intro = f"{bcolors.AI}Type /? or /help for help. Type /quit or /exit to exit."
+    inference = None
+
+    def __init__(self):
+        super().__init__()
+        self.conversation = None
+        self.response = None
+
+    def precmd(self, line):
+        if line.startswith('/'):
+            line = line[1:]
+            if line == "?":
+                line = "help"
+            elif line in ["quit", "exit"]:
+                line = "EOF"
+        else:
+            if line == "EOF":
+                line = "EOF"
+            else:
+                line = f"say {line}"
+        return line
+    
+    def do_EOF(self, line):
+        return True
+
+    def do_clear(self, line):
+        if self.conversation:
+            self.conversation.clear()
+
+    def do_conversation(self, line):
+        if self.conversation:
+            print(self.conversation)
+
+    def do_rewrite(self, line):
+        if self.conversation:
+            print(f"{bcolors.AI}Changed response to: {line}")
+            self.conversation.add_assistant(line)
+            self.response = None
+
+    def do_settings(self, line):
+        print(self.settings)
+
+    def do_seed(self, line):
+        try:
+            self.settings["seed"] = int(line)
+            if self.settings["seed"] >= 0:
+                print(self.settings["seed"])
+                utils.seed(self.settings["seed"])
+                self.do_clear(None)
+    #         else:
+    #             utils.seed(None)
+        except ValueError:
+            print(f"{line} is not an integer")
+
+    def do_temperature(self, line):
+        try:
+            self.settings["generate_args"]["temperature"] = float(line)
+        except ValueError:
+            print(f"{line} is not a float")
+
+    def do_max_tokens(self, line):
+        try:
+            self.settings["generate_args"]["max_tokens"] = int(line)
+        except ValueError:
+            print(f"{line} is not an integer")
+
+    def do_system_prompt(self, line):
+        self.settings["system_prompt"] = line
+        self.do_clear(None)
+        self.conversation = sillm.Conversation(self.settings["template"], system_prompt=line)
+
+
+    def do_help(self, line):
+        print(f"""{bcolors.AI}
+    /? or /help         - this message
+    /exit or /quit      - exit/quit
+    /clear              - reset conversation
+    /rewrite            - change the last reply from the AI
+    /seed               - change the seed
+    /conversation       - show the conversation
+    /settings           - print settings
+    /temperature        - change the temperature
+    /max_tokens         - change the max tokens
+    /system_prompt      - change the system prompt (resets the conversation)
+
+    Press esc to interrupt the AI.
+""")
+
+    def do_say(self, line):
+        if self.inference is not None:
+            if self.conversation and self.response:
+                self.conversation.add_assistant(self.response)
+
+            if self.conversation:
+                line = self.conversation.add_user(line)
+
+            self.response = self.inference(line, self.settings)
+
 if __name__ == "__main__":
+    print(bcolors.DEBUG)
+
     # Parse commandline arguments
     parser = argparse.ArgumentParser(description="A simple CLI for generating text with SiLLM.")
     parser.add_argument("model", type=str, help="The model directory or file")
@@ -40,9 +170,18 @@ if __name__ == "__main__":
     if log_level <= 10:
         utils.log_arguments(args.__dict__)
 
-    # Set random seed
-    if args.seed >= 0:
-        utils.seed(args.seed)
+    settings = {
+        "seed": args.seed,
+        "system_prompt": args.system_prompt,
+        "template": args.template,
+        "generate_args": {
+            "flush": args.flush,
+            "max_tokens": args.max_tokens,
+            "repetition_penalty": args.repetition_penalty,
+            "repetition_window": args.repetition_window,
+            "temperature": args.temperature,
+        }
+    }
 
     # Load model
     model = sillm.load(args.model)
@@ -66,45 +205,37 @@ if __name__ == "__main__":
     elif args.q8 is True:
         model.quantize(bits=8)
 
-    generate_args = {
-        "temperature": args.temperature,
-        "repetition_penalty": args.repetition_penalty,
-        "repetition_window": args.repetition_window,
-        "max_tokens": args.max_tokens,
-        "flush": args.flush
-    }
-
     # Init conversation template
-    template = sillm.init_template(model.tokenizer, model.args, args.template)
-    conversation = sillm.Conversation(template, system_prompt=args.system_prompt)
+    settings["template"] = sillm.init_template(model.tokenizer, model.args, settings["template"])
 
     # Log memory usage
     utils.log_memory_usage()
 
-    # Input loop
-    while True:
-        prompt = input("> ")
-
-        if prompt.startswith('.'):
-            break
-        elif prompt == "":
-            if conversation:
-                conversation.clear()
-            continue
-
-        if conversation:
-            prompt = conversation.add_user(prompt)
-        
+    def inference(prompt, settings):
+        print(bcolors.DEBUG)
         logger.debug(f"Generating {args.max_tokens} tokens with temperature {args.temperature}")
-
+        print(bcolors.AI)
         response = ""
-        for s, metadata in model.generate(prompt, **generate_args):
-            print(s, end="", flush=True)
-            response += s
+        with NonBlockingConsole() as nbc:
+            for s, metadata in model.generate(prompt, **settings["generate_args"]):
+                print(s, end="", flush=True)
+                response += s
+                if nbc.get_data() == '\x1b':  # x1b is ESC
+                    break
         print()
-
-        if conversation:
-            conversation.add_assistant(response)
-
+        print(bcolors.DEBUG)
         logger.debug(f"Evaluated {metadata['usage']['prompt_tokens']} prompt tokens in {metadata['timing']['eval_time']:.2f}s ({metadata['usage']['prompt_tokens'] / metadata['timing']['eval_time']:.2f} tok/sec)")
-        logger.debug(f"Generated {metadata['usage']['completion_tokens']} tokens in {metadata['timing']['runtime']:.2f}s ({metadata['usage']['completion_tokens'] / metadata['timing']['runtime']:.2f} tok/sec)")
+        logger.debug(f"Generated {metadata['usage']['completion_tokens']} tokens in {metadata['timing']['runtime']:.2f}s ({metadata['usage']['completion_tokens'] / metadata['timing']['runtime']:.2f} tok/sec).")
+        return response
+
+    # Interactive prompt
+    cmdPrompt = CommandPrompt()
+    cmdPrompt.settings = settings
+    cmdPrompt.inference = inference
+    cmdPrompt.do_system_prompt(settings["system_prompt"])
+    cmdPrompt.do_seed(settings["seed"])
+
+    try:
+        cmdPrompt.cmdloop()
+    except (KeyboardInterrupt):
+        pass
