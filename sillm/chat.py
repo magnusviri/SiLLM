@@ -62,10 +62,14 @@ class CommandPrompt(Cmd):
     def do_clear(self, line):
         if self.conversation:
             self.conversation.clear()
+            self.response = None
 
     def do_conversation(self, line):
         if self.conversation:
             print(self.conversation)
+            if self.response:
+                print("Last assistant response was:")
+                print(self.response)
 
     def do_rewrite(self, line):
         if self.conversation:
